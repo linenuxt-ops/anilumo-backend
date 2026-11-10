@@ -8,160 +8,84 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ==========================================
-// HELPERS & CACHE
-// ==========================================
+const JIKAN_API_URL = "https://api.jikan.moe/v4";
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-const cache = {
-  trending: { data: null, timestamp: 0 },
-  search: {},
-  details: {},
-};
-
-const CACHE_TTL = 5 * 60 * 1000; 
-
-const formatAniListData = (data) => {
-  return data.map((item) => ({
-    id: item.id,
-    idMal: item.idMal,
-    title: { romaji: item.title.romaji, english: item.title.english || item.title.romaji },
-    coverImage: { large: item.coverImage.large },
-    averageScore: item.averageScore,
-    format: item.format,
-    episodes: item.episodes || 0
-  }));
-};
-
 // ==========================================
-// 1. SEARCH (Powered by AniList)
+// 1. SEARCH (Powered by Jikan)
 // ==========================================
 app.get('/api/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Search query required" });
 
-  const cached = cache.search[query];
-  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-    console.log(`[Cache Hit] Search: ${query}`);
-    return res.json(cached.data);
-  }
-
-  const graphqlQuery = `
-    query ($search: String) {
-      Page(page: 1, perPage: 20) {
-        media(search: $search, type: ANIME) {
-          id
-          idMal
-          title { romaji english }
-          coverImage { large }
-          averageScore
-          format
-          episodes
-        }
-      }
-    }
-  `;
-
   try {
-    await sleep(2000); 
-    const response = await axios.post("https://graphql.anilist.co", {
-      query: graphqlQuery,
-      variables: { search: query },
+    await sleep(1000); // Delay to prevent rate limit
+    const response = await axios.get(`${JIKAN_API_URL}/anime`, {
+      params: { q: query, limit: 20, sfw: true }
     });
     
-    const formatted = formatAniListData(response.data.data.Page.media);
-    cache.search[query] = { data: formatted, timestamp: Date.now() };
+    const formatted = response.data.data.map((item) => ({
+      id: item.mal_id,
+      idMal: item.mal_id,
+      title: { romaji: item.title, english: item.title_english || item.title },
+      coverImage: { large: item.images.webp.large_image_url || item.images.jpg.large_image_url },
+      averageScore: item.score ? Math.round(item.score * 10) : null,
+      format: item.type,
+      episodes: item.episodes || 0
+    }));
     
     res.json(formatted);
   } catch (error) {
     console.error("Search Error:", error.message);
-    // 🚨 Send the exact error back to the app
     res.status(500).json({ error: "Search failed", details: error.message });
   }
 });
 
 // ==========================================
-// 2. TRENDING (Powered by AniList)
+// 2. TRENDING (Powered by Jikan)
 // ==========================================
 app.get('/api/trending', async (req, res) => {
-  if (cache.trending.data && (Date.now() - cache.trending.timestamp < CACHE_TTL)) {
-    console.log(`[Cache Hit] Trending`);
-    return res.json(cache.trending.data);
-  }
-
-  const query = `
-    query {
-      Page(page: 1, perPage: 20) {
-        media(sort: TRENDING_DESC, type: ANIME) {
-          id
-          idMal
-          title { romaji english }
-          coverImage { large }
-          averageScore
-          format
-          episodes
-        }
-      }
-    }
-  `;
-
   try {
-    await sleep(2000); 
-    const response = await axios.post("https://graphql.anilist.co", { query });
-    const formatted = formatAniListData(response.data.data.Page.media);
-    cache.trending = { data: formatted, timestamp: Date.now() };
+    await sleep(1000); // Delay to prevent rate limit
+    const response = await axios.get(`${JIKAN_API_URL}/top/anime`, {
+      params: { filter: 'airing', limit: 20 }
+    });
+    
+    const formatted = response.data.data.map((item) => ({
+      id: item.mal_id,
+      idMal: item.mal_id,
+      title: { romaji: item.title, english: item.title_english || item.title },
+      coverImage: { large: item.images.webp.large_image_url || item.images.jpg.large_image_url },
+      averageScore: item.score ? Math.round(item.score * 10) : null,
+      format: item.type,
+      episodes: item.episodes || 0
+    }));
+    
     res.json(formatted);
   } catch (error) {
     console.error("Trending Error:", error.message);
-    // 🚨 Send the exact error back to the app
     res.status(500).json({ error: "Trending failed", details: error.message });
   }
 });
 
 // ==========================================
-// 3. DETAILS + EPISODES (Powered by MAL)
+// 3. DETAILS + EPISODES + CHARACTERS + RELATIONS
 // ==========================================
 app.get('/api/anime/:id', async (req, res) => {
-  const anilistId = req.params.id;
-
-  const cached = cache.details[anilistId];
-  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-    console.log(`[Cache Hit] Details: ${anilistId}`);
-    return res.json(cached.data);
-  }
+  const malId = req.params.id;
 
   try {
-    const anilistQuery = `
-      query ($id: Int) {
-        Media(id: $id, type: ANIME) {
-          id
-          idMal
-          title { romaji english }
-          coverImage { large extraLarge }
-          bannerImage
-          description
-          averageScore
-          genres
-          episodes
-          status
-          format
-        }
-      }
-    `;
-    
-    await sleep(2000); 
-    const anilistRes = await axios.post("https://graphql.anilist.co", { query: anilistQuery, variables: { id: parseInt(anilistId) } });
-    const animeData = anilistRes.data.data.Media;
-
-    if (!animeData || !animeData.idMal) {
-      return res.status(404).json({ error: "MAL ID not found for this anime." });
-    }
+    await sleep(1000); 
+    // Fetch full details (includes characters and relations)
+    const animeRes = await axios.get(`${JIKAN_API_URL}/anime/${malId}/full`);
+    const anime = animeRes.data.data;
 
     let episodes = [];
     try {
-      const jikanRes = await axios.get(`https://api.jikan.moe/v4/anime/${animeData.idMal}/episodes`);
-      if (jikanRes.data.data) {
-        episodes = jikanRes.data.data.map((ep) => ({
+      await sleep(800); // Small delay between calls
+      const epRes = await axios.get(`${JIKAN_API_URL}/anime/${malId}/episodes`);
+      if (epRes.data.data) {
+        episodes = epRes.data.data.map((ep) => ({
           number: ep.mal_id,
           title: ep.title || `Episode ${ep.mal_id}`,
           thumbnail: "",
@@ -170,30 +94,44 @@ app.get('/api/anime/:id', async (req, res) => {
         }));
       }
     } catch (e) {
-      console.log("Jikan failed:", e.message);
+      console.log("Episode list failed, using count fallback.");
     }
 
-    if (episodes.length === 0 && animeData.episodes) {
-      for (let i = 1; i <= animeData.episodes; i++) {
+    // Fallback if episode list fails
+    if (episodes.length === 0 && anime.episodes) {
+      for (let i = 1; i <= anime.episodes; i++) {
         episodes.push({ number: i, title: `Episode ${i}`, thumbnail: "", description: "", available: true });
       }
     }
 
     const finalData = {
-      ...animeData,
-      episodes: episodes
+      id: anime.mal_id,
+      idMal: anime.mal_id,
+      title: { romaji: anime.title, english: anime.title_english || anime.title },
+      coverImage: { 
+        large: anime.images.webp.large_image_url || anime.images.jpg.large_image_url, 
+        extraLarge: anime.images.webp.large_image_url || anime.images.jpg.large_image_url 
+      },
+      bannerImage: "", 
+      description: anime.synopsis || "No description available.",
+      averageScore: anime.score ? Math.round(anime.score * 10) : null,
+      genres: anime.genres?.map((g) => g.name) || [],
+      episodes: episodes,
+      status: anime.status,
+      format: anime.type,
+      characters: anime.characters || [],
+      relations: anime.relations || []
     };
 
-    cache.details[anilistId] = { data: finalData, timestamp: Date.now() };
     res.json(finalData);
-
   } catch (error) {
     console.error("Details Error:", error.message);
-    // 🚨 Send the exact error back to the app
     res.status(500).json({ error: "Details failed", details: error.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+app.get('/', (req, res) => {
+  res.send('AniLumoS Backend is running!');
 });
+
+app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
