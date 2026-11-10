@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const JIKAN_API_URL = "https://corsproxy.io/?https://api.jikan.moe/v4"";
+const JIKAN_API_URL = "https://corsproxy.io/?https://api.jikan.moe/v4";
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ==========================================
