@@ -9,12 +9,24 @@ app.use(cors());
 app.use(express.json());
 
 // ==========================================
-// HELPER: Format AniList Data
+// HELPERS & CACHE
 // ==========================================
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// A simple in-memory cache (resets when Render restarts)
+const cache = {
+  trending: { data: null, timestamp: 0 },
+  search: {}, // Stores results keyed by search query
+  details: {}, // Stores results keyed by anime ID
+};
+
+// Cache duration: 5 minutes (in milliseconds)
+const CACHE_TTL = 5 * 60 * 1000; 
+
 const formatAniListData = (data) => {
   return data.map((item) => ({
     id: item.id,
-    idMal: item.idMal, // 🚨 Crucial for the MAL bridge
+    idMal: item.idMal,
     title: { romaji: item.title.romaji, english: item.title.english || item.title.romaji },
     coverImage: { large: item.coverImage.large },
     averageScore: item.averageScore,
@@ -29,6 +41,13 @@ const formatAniListData = (data) => {
 app.get('/api/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Search query required" });
+
+  // 🚨 Check Cache
+  const cached = cache.search[query];
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+    console.log(`[Cache Hit] Search: ${query}`);
+    return res.json(cached.data);
+  }
 
   const graphqlQuery = `
     query ($search: String) {
@@ -47,11 +66,18 @@ app.get('/api/search', async (req, res) => {
   `;
 
   try {
+    await sleep(2000); // 🚨 Delay to prevent 429
     const response = await axios.post("https://graphql.anilist.co", {
       query: graphqlQuery,
       variables: { search: query },
     });
-    res.json(formatAniListData(response.data.data.Page.media));
+    
+    const formatted = formatAniListData(response.data.data.Page.media);
+    
+    // Save to Cache
+    cache.search[query] = { data: formatted, timestamp: Date.now() };
+    
+    res.json(formatted);
   } catch (error) {
     console.error("Search Error:", error.message);
     res.status(500).json({ error: "Search failed" });
@@ -62,6 +88,12 @@ app.get('/api/search', async (req, res) => {
 // 2. TRENDING (Powered by AniList)
 // ==========================================
 app.get('/api/trending', async (req, res) => {
+  // 🚨 Check Cache
+  if (cache.trending.data && (Date.now() - cache.trending.timestamp < CACHE_TTL)) {
+    console.log(`[Cache Hit] Trending`);
+    return res.json(cache.trending.data);
+  }
+
   const query = `
     query {
       Page(page: 1, perPage: 20) {
@@ -79,8 +111,15 @@ app.get('/api/trending', async (req, res) => {
   `;
 
   try {
+    await sleep(2000); // 🚨 Delay to prevent 429
     const response = await axios.post("https://graphql.anilist.co", { query });
-    res.json(formatAniListData(response.data.data.Page.media));
+    
+    const formatted = formatAniListData(response.data.data.Page.media);
+    
+    // Save to Cache
+    cache.trending = { data: formatted, timestamp: Date.now() };
+    
+    res.json(formatted);
   } catch (error) {
     console.error("Trending Error:", error.message);
     res.status(500).json({ error: "Trending failed" });
@@ -92,6 +131,13 @@ app.get('/api/trending', async (req, res) => {
 // ==========================================
 app.get('/api/anime/:id', async (req, res) => {
   const anilistId = req.params.id;
+
+  // 🚨 Check Cache
+  const cached = cache.details[anilistId];
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+    console.log(`[Cache Hit] Details: ${anilistId}`);
+    return res.json(cached.data);
+  }
 
   try {
     // Step A: Get the MAL ID from AniList
@@ -112,6 +158,8 @@ app.get('/api/anime/:id', async (req, res) => {
         }
       }
     `;
+    
+    await sleep(2000); // 🚨 Delay to prevent 429
     const anilistRes = await axios.post("https://graphql.anilist.co", { query: anilistQuery, variables: { id: parseInt(anilistId) } });
     const animeData = anilistRes.data.data.Media;
 
@@ -120,7 +168,6 @@ app.get('/api/anime/:id', async (req, res) => {
     }
 
     // Step B: Get Episodes from MAL (via Jikan for titles)
-    // 🚨 Note: The official MAL API doesn't list episodes, so we use Jikan for the list
     let episodes = [];
     try {
       const jikanRes = await axios.get(`https://api.jikan.moe/v4/anime/${animeData.idMal}/episodes`);
@@ -128,7 +175,7 @@ app.get('/api/anime/:id', async (req, res) => {
         episodes = jikanRes.data.data.map((ep) => ({
           number: ep.mal_id,
           title: ep.title || `Episode ${ep.mal_id}`,
-          thumbnail: "", // Jikan doesn't provide thumbnails
+          thumbnail: "",
           description: "",
           available: true
         }));
@@ -145,10 +192,15 @@ app.get('/api/anime/:id', async (req, res) => {
     }
 
     // Step D: Return merged data
-    res.json({
+    const finalData = {
       ...animeData,
-      episodes: episodes // Overwrite the number with the actual list
-    });
+      episodes: episodes
+    };
+
+    // Save to Cache
+    cache.details[anilistId] = { data: finalData, timestamp: Date.now() };
+
+    res.json(finalData);
 
   } catch (error) {
     console.error("Details Error:", error.message);
