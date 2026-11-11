@@ -10,7 +10,15 @@ app.use(express.json());
 
 const ANILIST_URL = "https://graphql.anilist.co";
 
-// Helper to format AniList data for the frontend
+// 🚨 Add headers to prevent AniList from blocking the request
+const axiosConfig = {
+  headers: {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  }
+};
+
 const formatAniList = (data) => {
   return data.map((item) => ({
     id: item.id,
@@ -24,7 +32,7 @@ const formatAniList = (data) => {
 };
 
 // ==========================================
-// 1. SEARCH (Powered by AniList)
+// 1. SEARCH
 // ==========================================
 app.get('/api/search', async (req, res) => {
   const query = req.query.q;
@@ -47,15 +55,16 @@ app.get('/api/search', async (req, res) => {
   `;
 
   try {
-    const response = await axios.post(ANILIST_URL, { query: gql, variables: { search: query } });
+    const response = await axios.post(ANILIST_URL, { query: gql, variables: { search: query } }, axiosConfig);
     res.json(formatAniList(response.data.data.Page.media));
   } catch (error) {
+    console.error("Search Error:", error.message);
     res.status(500).json({ error: "Search failed", details: error.message });
   }
 });
 
 // ==========================================
-// 2. TRENDING (Powered by AniList)
+// 2. TRENDING
 // ==========================================
 app.get('/api/trending', async (req, res) => {
   const gql = `
@@ -75,15 +84,16 @@ app.get('/api/trending', async (req, res) => {
   `;
 
   try {
-    const response = await axios.post(ANILIST_URL, { query: gql });
+    const response = await axios.post(ANILIST_URL, { query: gql }, axiosConfig);
     res.json(formatAniList(response.data.data.Page.media));
   } catch (error) {
+    console.error("Trending Error:", error.message);
     res.status(500).json({ error: "Trending failed", details: error.message });
   }
 });
 
 // ==========================================
-// 3. DETAILS + EPISODES (Powered by AniList)
+// 3. DETAILS + EPISODES
 // ==========================================
 app.get('/api/anime/:id', async (req, res) => {
   const anilistId = req.params.id;
@@ -126,14 +136,13 @@ app.get('/api/anime/:id', async (req, res) => {
   `;
 
   try {
-    const response = await axios.post(ANILIST_URL, { query: gql, variables: { id: parseInt(anilistId) } });
+    const response = await axios.post(ANILIST_URL, { query: gql, variables: { id: parseInt(anilistId) } }, axiosConfig);
     const animeData = response.data.data.Media;
 
     if (!animeData) {
       return res.status(404).json({ error: "Anime not found." });
     }
 
-    // Build the episode list from AniList's streamingEpisodes
     let episodes = [];
     const streamingData = animeData.streamingEpisodes || [];
 
@@ -146,7 +155,6 @@ app.get('/api/anime/:id', async (req, res) => {
         available: true
       }));
     } else if (animeData.episodes > 0) {
-      // Fallback if streamingEpisodes is empty but a count exists
       for (let i = 1; i <= animeData.episodes; i++) {
         episodes.push({ number: i, title: `Episode ${i}`, thumbnail: "", description: "", available: true });
       }
@@ -158,6 +166,7 @@ app.get('/api/anime/:id', async (req, res) => {
     });
 
   } catch (error) {
+    console.error("Details Error:", error.message);
     res.status(500).json({ error: "Details failed", details: error.message });
   }
 });
