@@ -10,13 +10,25 @@ app.use(express.json());
 
 const ANILIST_URL = "https://graphql.anilist.co";
 
-// 🚨 Add headers to prevent AniList from blocking the request
-const axiosConfig = {
-  headers: {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+// 🚨 1. Add a Sleep function to delay requests
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// 🚨 2. Add a Cache to store results
+const cache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+const getFromCache = (key) => {
+  const item = cache.get(key);
+  if (!item) return null;
+  if (Date.now() > item.expiresAt) {
+    cache.delete(key);
+    return null;
   }
+  return item.data;
+};
+
+const saveToCache = (key, data) => {
+  cache.set(key, { data: data, expiresAt: Date.now() + CACHE_TTL });
 };
 
 const formatAniList = (data) => {
@@ -38,6 +50,14 @@ app.get('/api/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: "Query required" });
 
+  // Check Cache
+  const cacheKey = `search:${query.toLowerCase()}`;
+  const cachedData = getFromCache(cacheKey);
+  if (cachedData) {
+    console.log(`[Cache Hit] Search: ${query}`);
+    return res.json(cachedData);
+  }
+
   const gql = `
     query ($search: String) {
       Page(page: 1, perPage: 20) {
@@ -55,8 +75,13 @@ app.get('/api/search', async (req, res) => {
   `;
 
   try {
-    const response = await axios.post(ANILIST_URL, { query: gql, variables: { search: query } }, axiosConfig);
-    res.json(formatAniList(response.data.data.Page.media));
+    console.log(`[Cache Miss] Searching AniList for: ${query}`);
+    await sleep(2000); // 🚨 Wait 2 seconds to avoid rate limit
+    const response = await axios.post(ANILIST_URL, { query: gql, variables: { search: query } });
+    
+    const formatted = formatAniList(response.data.data.Page.media);
+    saveToCache(cacheKey, formatted);
+    res.json(formatted);
   } catch (error) {
     console.error("Search Error:", error.message);
     res.status(500).json({ error: "Search failed", details: error.message });
@@ -67,6 +92,13 @@ app.get('/api/search', async (req, res) => {
 // 2. TRENDING
 // ==========================================
 app.get('/api/trending', async (req, res) => {
+  const cacheKey = 'trending:airing';
+  const cachedData = getFromCache(cacheKey);
+  if (cachedData) {
+    console.log(`[Cache Hit] Trending`);
+    return res.json(cachedData);
+  }
+
   const gql = `
     query {
       Page(page: 1, perPage: 20) {
@@ -84,8 +116,13 @@ app.get('/api/trending', async (req, res) => {
   `;
 
   try {
-    const response = await axios.post(ANILIST_URL, { query: gql }, axiosConfig);
-    res.json(formatAniList(response.data.data.Page.media));
+    console.log(`[Cache Miss] Fetching Trending from AniList`);
+    await sleep(2000); // 🚨 Wait 2 seconds to avoid rate limit
+    const response = await axios.post(ANILIST_URL, { query: gql });
+    
+    const formatted = formatAniList(response.data.data.Page.media);
+    saveToCache(cacheKey, formatted);
+    res.json(formatted);
   } catch (error) {
     console.error("Trending Error:", error.message);
     res.status(500).json({ error: "Trending failed", details: error.message });
@@ -97,6 +134,13 @@ app.get('/api/trending', async (req, res) => {
 // ==========================================
 app.get('/api/anime/:id', async (req, res) => {
   const anilistId = req.params.id;
+  const cacheKey = `anime:${anilistId}`;
+  
+  const cachedData = getFromCache(cacheKey);
+  if (cachedData) {
+    console.log(`[Cache Hit] Details: ${anilistId}`);
+    return res.json(cachedData);
+  }
 
   const gql = `
     query ($id: Int) {
@@ -136,7 +180,9 @@ app.get('/api/anime/:id', async (req, res) => {
   `;
 
   try {
-    const response = await axios.post(ANILIST_URL, { query: gql, variables: { id: parseInt(anilistId) } }, axiosConfig);
+    console.log(`[Cache Miss] Fetching Details for ID: ${anilistId}`);
+    await sleep(2000); // 🚨 Wait 2 seconds to avoid rate limit
+    const response = await axios.post(ANILIST_URL, { query: gql, variables: { id: parseInt(anilistId) } });
     const animeData = response.data.data.Media;
 
     if (!animeData) {
@@ -160,10 +206,9 @@ app.get('/api/anime/:id', async (req, res) => {
       }
     }
 
-    res.json({
-      ...animeData,
-      episodes: episodes
-    });
+    const finalData = { ...animeData, episodes: episodes };
+    saveToCache(cacheKey, finalData);
+    res.json(finalData);
 
   } catch (error) {
     console.error("Details Error:", error.message);
