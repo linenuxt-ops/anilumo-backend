@@ -1,7 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { chromium } = require('playwright'); // 🚨 Import Playwright
+const { chromium } = require('playwright');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,52 +14,80 @@ const bypassHeaders = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 };
 
+// Simple in-memory cache so repeated requests don't re-launch Chromium every time
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let cachedM3u8 = {
+    url: null,
+    expiresAt: 0
+};
+
 // ==========================================
 // 1. AUTO-EXTRACT & PLAY ROUTE
 // ==========================================
 app.get('/', async (req, res) => {
-    // 🚨 The specific Miruro link you requested
-    const targetUrl = "https://www.miruro.cx/watch/o8FU9Se7l1zWPEIo28kel7S1tthb6ldF/one-piece?ep=1155"; 
-    
+    const targetUrl = "https://www.miruro.cx/watch/o8FU9Se7l1zWPEIo28kel7S1tthb6ldF/one-piece?ep=1155";
+    const forceRefresh = req.query.refresh === '1';
+
     let extractedM3u8 = null;
 
-    try {
-        console.log("Launching hidden browser to extract video from Miruro...");
-        
-        // Launch headless browser
-        const browser = await chromium.launch({ headless: true });
-        const context = await browser.newContext({
-            userAgent: bypassHeaders["User-Agent"]
-        });
-        const page = await context.newPage();
+    if (!forceRefresh && cachedM3u8.url && Date.now() < cachedM3u8.expiresAt) {
+        extractedM3u8 = cachedM3u8.url;
+    } else {
+        let browser = null;
 
-        // Listen for the m3u8 network request
-        page.on('request', request => {
-            const url = request.url();
-            if (url.includes('.m3u8') && !extractedM3u8) {
-                console.log("🎯 Found M3U8:", url);
-                extractedM3u8 = url;
+        try {
+            console.log("Launching hidden browser to extract video from Miruro...");
+
+            browser = await chromium.launch({
+                headless: true,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--no-zygote'
+                ]
+            });
+
+            const context = await browser.newContext({
+                userAgent: bypassHeaders["User-Agent"]
+            });
+            const page = await context.newPage();
+
+            page.on('request', request => {
+                const url = request.url();
+                if (url.includes('.m3u8') && !extractedM3u8) {
+                    console.log("🎯 Found M3U8:", url);
+                    extractedM3u8 = url;
+                }
+            });
+
+            await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+
+            // Poll up to ~10 seconds and stop early as soon as the .m3u8 URL is captured
+            for (let i = 0; i < 20 && !extractedM3u8; i++) {
+                await page.waitForTimeout(500);
             }
-        });
 
-        // Go to the page and wait for network to settle
-        await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 30000 });
-        
-        // Wait an extra 3 seconds in case the player takes a moment to fire the request
-        await page.waitForTimeout(3000);
-
-        await browser.close();
-
-    } catch (error) {
-        console.error("Browser Error:", error.message);
+            if (extractedM3u8) {
+                cachedM3u8 = {
+                    url: extractedM3u8,
+                    expiresAt: Date.now() + CACHE_TTL_MS
+                };
+            }
+        } catch (error) {
+            console.error("Browser Error:", error.message);
+        } finally {
+            if (browser) {
+                await browser.close().catch(() => {});
+            }
+        }
     }
 
-    // If extraction failed, show an error
     if (!extractedM3u8) {
         return res.status(500).send("Could not find the M3U8 link. Miruro might be blocking the headless browser, or the link is invalid.");
     }
 
-    // Send the HTML with the newly found link
     const proxyUrl = `/api/proxy?url=${encodeURIComponent(extractedM3u8)}`;
 
     res.send(`
@@ -104,20 +132,18 @@ app.get('/api/proxy', async (req, res) => {
 
     try {
         const isM3u8 = videoUrl.includes('.m3u8');
-        
+
         const response = await axios({
             method: 'GET',
             url: videoUrl,
             headers: bypassHeaders,
-            // 🚨 Read m3u8 as text, read .ts chunks as stream
-            responseType: isM3u8 ? 'text' : 'stream' 
+            responseType: isM3u8 ? 'text' : 'stream'
         });
 
         if (isM3u8) {
             let m3u8Text = response.data;
             const baseUrl = new URL(videoUrl);
-            
-            // Rewrite internal links to go through our proxy
+
             m3u8Text = m3u8Text.split('\n').map(line => {
                 line = line.trim();
                 if (line && !line.startsWith('#')) {
@@ -131,7 +157,6 @@ app.get('/api/proxy', async (req, res) => {
             return res.send(m3u8Text);
         }
 
-        // Pipe the video chunks
         res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp2t');
         if (response.headers['content-length']) {
             res.setHeader('Content-Length', response.headers['content-length']);
@@ -144,4 +169,5 @@ app.get('/api/proxy', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`Server running. Open http://localhost:${PORT} to test!`));
+// Bind to 0.0.0.0 so container health checks detect the open port immediately
+app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
