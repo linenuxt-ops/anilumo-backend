@@ -6,215 +6,97 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
 
-const ANILIST_URL = "https://graphql.anilist.co";
-
-// 🚨 1. Add a Sleep function to delay requests
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// 🚨 2. Add a Cache to store results
-const cache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-const getFromCache = (key) => {
-  const item = cache.get(key);
-  if (!item) return null;
-  if (Date.now() > item.expiresAt) {
-    cache.delete(key);
-    return null;
-  }
-  return item.data;
-};
-
-const saveToCache = (key, data) => {
-  cache.set(key, { data: data, expiresAt: Date.now() + CACHE_TTL });
-};
-
-const formatAniList = (data) => {
-  return data.map((item) => ({
-    id: item.id,
-    idMal: item.idMal,
-    title: { romaji: item.title.romaji, english: item.title.english || item.title.romaji },
-    coverImage: { large: item.coverImage.large },
-    averageScore: item.averageScore,
-    format: item.format,
-    episodes: item.episodes || 0
-  }));
+// 🚨 Headers to bypass the 403 (Hotlink protection)
+const bypassHeaders = {
+    "Referer": "https://www.miruro.cx/",
+    "Origin": "https://www.miruro.cx",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 };
 
 // ==========================================
-// 1. SEARCH
+// 1. LIVE TEST PLAYER (Open http://localhost:3000/ in browser)
 // ==========================================
-app.get('/api/search', async (req, res) => {
-  const query = req.query.q;
-  if (!query) return res.status(400).json({ error: "Query required" });
+app.get('/', (req, res) => {
+    // Paste your real extracted .m3u8 link here to test
+    const testUrl = "https://calmgrove.crystal-61.top/m/YOUR_EXTRACTED_LINK_HERE.m3u8"; 
+    const proxyUrl = `/api/proxy?url=${encodeURIComponent(testUrl)}`;
 
-  // Check Cache
-  const cacheKey = `search:${query.toLowerCase()}`;
-  const cachedData = getFromCache(cacheKey);
-  if (cachedData) {
-    console.log(`[Cache Hit] Search: ${query}`);
-    return res.json(cachedData);
-  }
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Video Proxy Test</title>
+            <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+            <style>
+                body { background: #111; color: white; font-family: sans-serif; text-align: center; margin-top: 50px; }
+                video { width: 80%; max-width: 800px; border-radius: 8px; background: black; }
+            </style>
+        </head>
+        <body>
+            <h1>WebView / Browser Test Player</h1>
+            <p>If the video plays here, your API works perfectly.</p>
+            <video id="video" controls autoplay></video>
+            <script>
+                const video = document.getElementById('video');
+                const videoSrc = "${proxyUrl}";
 
-  const gql = `
-    query ($search: String) {
-      Page(page: 1, perPage: 20) {
-        media(search: $search, type: ANIME) {
-          id
-          idMal
-          title { romaji english }
-          coverImage { large }
-          averageScore
-          format
-          episodes
-        }
-      }
-    }
-  `;
-
-  try {
-    console.log(`[Cache Miss] Searching AniList for: ${query}`);
-    await sleep(2000); // 🚨 Wait 2 seconds to avoid rate limit
-    const response = await axios.post(ANILIST_URL, { query: gql, variables: { search: query } });
-    
-    const formatted = formatAniList(response.data.data.Page.media);
-    saveToCache(cacheKey, formatted);
-    res.json(formatted);
-  } catch (error) {
-    console.error("Search Error:", error.message);
-    res.status(500).json({ error: "Search failed", details: error.message });
-  }
+                if (Hls.isSupported()) {
+                    const hls = new Hls();
+                    hls.loadSource(videoSrc);
+                    hls.attachMedia(video);
+                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                    video.src = videoSrc;
+                }
+            </script>
+        </body>
+        </html>
+    `);
 });
 
 // ==========================================
-// 2. TRENDING
+// 2. MAGIC PROXY (Handles CORS + Rewrites m3u8)
 // ==========================================
-app.get('/api/trending', async (req, res) => {
-  const cacheKey = 'trending:airing';
-  const cachedData = getFromCache(cacheKey);
-  if (cachedData) {
-    console.log(`[Cache Hit] Trending`);
-    return res.json(cachedData);
-  }
+app.get('/api/proxy', async (req, res) => {
+    const videoUrl = req.query.url;
+    if (!videoUrl) return res.status(400).send("URL required");
 
-  const gql = `
-    query {
-      Page(page: 1, perPage: 20) {
-        media(sort: TRENDING_DESC, type: ANIME) {
-          id
-          idMal
-          title { romaji english }
-          coverImage { large }
-          averageScore
-          format
-          episodes
+    try {
+        const response = await axios({
+            method: 'GET',
+            url: videoUrl,
+            headers: bypassHeaders,
+            responseType: 'text' // Get as text so we can rewrite if it's an m3u8
+        });
+
+        // If the server returns an m3u8 file, we need to rewrite its internal links!
+        if (videoUrl.includes('.m3u8') || response.headers['content-type']?.includes('mpegurl')) {
+            let m3u8Text = response.data;
+            
+            // Rewrite all http/https links inside the m3u8 to go through our proxy
+            const baseUrl = new URL(videoUrl);
+            m3u8Text = m3u8Text.split('\n').map(line => {
+                line = line.trim();
+                if (line && !line.startsWith('#')) {
+                    // Handle relative and absolute URLs inside the m3u8
+                    const absoluteUrl = new URL(line, baseUrl).href;
+                    return `/api/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+                }
+                return line;
+            }).join('\n');
+
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            return res.send(m3u8Text);
         }
-      }
-    }
-  `;
 
-  try {
-    console.log(`[Cache Miss] Fetching Trending from AniList`);
-    await sleep(2000); // 🚨 Wait 2 seconds to avoid rate limit
-    const response = await axios.post(ANILIST_URL, { query: gql });
-    
-    const formatted = formatAniList(response.data.data.Page.media);
-    saveToCache(cacheKey, formatted);
-    res.json(formatted);
-  } catch (error) {
-    console.error("Trending Error:", error.message);
-    res.status(500).json({ error: "Trending failed", details: error.message });
-  }
+        // If it's a video chunk (.ts), we just send it back as a binary stream
+        res.setHeader('Content-Type', response.headers['content-type']);
+        res.send(response.data);
+
+    } catch (error) {
+        console.error("Proxy Error on:", videoUrl);
+        res.status(500).send("Proxy failed: " + error.message);
+    }
 });
 
-// ==========================================
-// 3. DETAILS + EPISODES
-// ==========================================
-app.get('/api/anime/:id', async (req, res) => {
-  const anilistId = req.params.id;
-  const cacheKey = `anime:${anilistId}`;
-  
-  const cachedData = getFromCache(cacheKey);
-  if (cachedData) {
-    console.log(`[Cache Hit] Details: ${anilistId}`);
-    return res.json(cachedData);
-  }
-
-  const gql = `
-    query ($id: Int) {
-      Media(id: $id, type: ANIME) {
-        id
-        idMal
-        title { romaji english }
-        coverImage { large extraLarge }
-        bannerImage
-        description
-        averageScore
-        genres
-        episodes
-        status
-        format
-        relations {
-          edges {
-            relationType
-            node { id title { romaji english } coverImage { large } format }
-          }
-        }
-        streamingEpisodes { title thumbnail url }
-        characters(perPage: 12, sort: [ROLE, RELEVANCE, ID]) {
-          edges {
-            role
-            node { id name { full } image { large } }
-            voiceActors(language: JAPANESE) { id name { full } image { large } }
-          }
-        }
-        recommendations(perPage: 12, sort: RATING_DESC) {
-          nodes {
-            mediaRecommendation { id title { romaji english } coverImage { large } averageScore format episodes }
-          }
-        }
-      }
-    }
-  `;
-
-  try {
-    console.log(`[Cache Miss] Fetching Details for ID: ${anilistId}`);
-    await sleep(2000); // 🚨 Wait 2 seconds to avoid rate limit
-    const response = await axios.post(ANILIST_URL, { query: gql, variables: { id: parseInt(anilistId) } });
-    const animeData = response.data.data.Media;
-
-    if (!animeData) {
-      return res.status(404).json({ error: "Anime not found." });
-    }
-
-    let episodes = [];
-    const streamingData = animeData.streamingEpisodes || [];
-
-    if (streamingData.length > 0) {
-      episodes = streamingData.map((ep, index) => ({
-        number: index + 1,
-        title: ep.title?.replace(/^Episode \d+ - /i, '') || `Episode ${index + 1}`,
-        thumbnail: ep.thumbnail || "",
-        description: "",
-        available: true
-      }));
-    } else if (animeData.episodes > 0) {
-      for (let i = 1; i <= animeData.episodes; i++) {
-        episodes.push({ number: i, title: `Episode ${i}`, thumbnail: "", description: "", available: true });
-      }
-    }
-
-    const finalData = { ...animeData, episodes: episodes };
-    saveToCache(cacheKey, finalData);
-    res.json(finalData);
-
-  } catch (error) {
-    console.error("Details Error:", error.message);
-    res.status(500).json({ error: "Details failed", details: error.message });
-  }
-});
-
-app.get('/', (req, res) => res.send('AniLumoS Backend is running!'));
-app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running. Open http://localhost:${PORT} to test!`));
